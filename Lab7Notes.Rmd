@@ -1,0 +1,433 @@
+---
+title: "Lab 7 Notes"
+author: "Alyssa Winchell"
+date: "February 21, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load Packages
+
+```{r include=FALSE}
+
+library(tidyverse)
+library(tmap)
+library(sf)
+library(spatstat)
+library(maptools)
+library(sp)
+library(raster)
+library(gstat)
+
+```
+
+Part 1: Hawaii raster practice
+
+```{r}
+
+hi_par <- raster("PAR_CLIM_M.tif")
+
+hi_sst <- raster("SST_LTM.tif")
+
+hi_chl <- raster("CHL_LTM.tif")
+
+par(mfrow = c(1,3))
+plot(hi_par)
+plot(hi_sst)
+plot(hi_chl)
+
+#can call one of these rasters in console and it will give lots of info about it eg resolution, extent, dimensions, CRS...
+#hi_sst@extent in console will also give that specific info
+
+```
+
+Reproject to WGS84:
+
+```{r}
+
+#spacing matters for this code
+wgs84 <- "+proj=longlat +datumWGS84 +ellps=WGS84 +no_defs"
+
+hi_sst_84 <- projectRaster(hi_sst, crs = wgs84, method = "bilinear")
+hi_sst_84@crs
+
+plot(hi_sst_84)
+#to change resolution if higher than needed, can resample using agregate
+
+```
+
+Resample: use raster::aggregate()
+
+```{r}
+
+sst_rs <-aggregate(hi_sst, fact = 10)
+plot(sst_rs)
+#do only when it makes sense but be careful. can be useful to use when just checking if code is working so you don't have to load a lot
+
+```
+
+Crop a raster:
+
+```{r}
+
+hi_sst_84@extent
+plot(hi_sst_84)
+
+#create a reasonable bounding box
+bounds <- as(extent(-156.2, -154.5, 18.7, 20.4), 'SpatialPolygons')
+
+crs(bounds) <- crs(hi_sst_84) #make bounds' CRS match hi_sst_84 but still keeps its own extent
+
+sst_crop <- crop(hi_sst_84, bounds) #crop the raster by the bounds
+plot(sst_crop)
+
+```
+
+Simple raster math:
+
+Nonsensical variable called "tropicality" that is the sum of PAR +SST + 2*ChlA and we want to map that variable
+
+```{r}
+
+hi_par_84 <- projectRaster(hi_par, crs = wgs84, metod = "bilinear") #bilinear for continuous, nearest neighbor for thematic/categorical raster data using methos = "ngm"
+#check CRS in console: hi_par_84@crs
+
+hi_chl_84 <- projectRaster(hi_chl, crs = wgs84, metod = "bilinear")
+
+par(mfrow = c(1,3))
+plot(hi_par_84)
+plot(hi_sst_84)
+plot(hi_chl_84)
+#they are not in the same scale on legend
+
+```
+
+```{r}
+
+trop <- hi_par_84 + hi_sst_84 + 2*hi_chl_84 #some things are excluded bc there are extent issues (that's what the warning that comes up means)
+plot(trop)
+
+```
+
+Now let's look at something using tmap:
+
+```{r}
+
+#make folder that its in the working directory
+islands <- read_sf(dsn = 'islands', layer = "Island_boundaries") %>%
+  dplyr::select(Island) %>%
+  st_simplify(dTolerance = 10) %>%
+  st_transform(crs = 4326) #puts it into wgs84 CRS
+
+plot(islands)
+
+```
+
+Use tmap to view
+
+static viewing instead of interactive: mode plot instead of view
+
+```{r}
+
+tmap_mode("plot")
+
+sst_map <- tm_shape(hi_sst_84) +
+  tm_raster(title = "Mean Sea Surface Temperature")+
+  tm_layout(bg.color = "navyblue",
+            legend.position = c("left", "bottom"),
+            legend.text.color = "white",
+            legend.text.size = 0.5) +
+  tm_shape(islands) +
+  tm_fill("darkgreen")
+
+tmap_save(sst_map, "HawaiiExample.png", height = 5) #will save it rather than plotting it. don't include if you only want to plot
+
+```
+
+Conditional rasters and masking:
+
+Let's say we have a sensitive species and we're trying to find habitat it might like. We know they like warm water (average >= 25.6 degress) and solar (PAR) below 54. Very rough example, mostly for the Skills.
+
+```{r}
+
+#check to see if deminstions and extent match for your layers and then make them align perfectly
+#make extent the same
+extent(hi_sst_84) <- extent(hi_par_84)
+
+cr <- raster(nrow = 822, 
+             ncol = 1229, 
+             xmn = -160.4365, 
+             xmx = -154.5373, 
+             ymn = 18.7309, 
+             ymx = 22.44634) #matches the one we want to resample to
+
+sst_new <- resample(hi_sst_84, cr) #instead of cr, could also just put in the raster that you want it to match directly
+
+#tells you if things match within rasters
+compareRaster(sst_new, hi_par_84) #if error, tells you what is different and what to fix
+
+plot(sst_new)
+plot(hi_par_84)
+
+#make cropped version for just hawaii
+
+bounds_main <- as(extent(-159.9, -159.2, 21.7, 22.3), 'SpatialPolygons')
+
+crs(bounds_main) <- crs(sst_new)
+
+par_kauai <- crop(hi_par_84, bounds_main)
+sst_kauai <- crop(sst_new, bounds_main)
+
+plot(par_kauai)
+plot(sst_kauai)
+
+compareRaster(sst_kauai, par_kauai)
+
+```
+
+Now we only want to isolate regions where temp >= 25.4, PAR < 54
+
+```{r}
+
+par_hab <- par_kauai
+par_hab[par_hab >= 54] <- NA
+plot(par_hab)
+
+sst_hab <- sst_kauai
+sst_hab[sst_hab < 25.4] <- NA
+plot(sst_hab)
+
+#find their intersection through masking. raster:: mask
+suit_hab <- mask(sst_hab, par_hab)
+plot(suit_hab)
+
+```
+
+##Part 2: point pattern analysis
+
+An analysis of red tree voles in Humboldt County
+
+Read in data:
+
+```{r}
+
+voles <- read_sf(dsn = 'redtreevoledata', layer = "ds033") %>%
+  dplyr::select(COUNTY) %>%
+  filter(COUNTY == "HUM") %>% 
+  st_transform(crs = 4326)
+
+plot(voles)
+
+#get humoldt county outline
+humboldt <- read_sf(dsn = 'redtreevoledata', layer = "california_county_shape_file") %>%
+  filter(NAME == "Humboldt") %>%
+  dplyr::select(NAME)
+
+st_crs(humboldt) <- 4326
+
+plot(humboldt)
+
+#plot both together
+tm_shape(humboldt) +
+  tm_fill() +
+  tm_shape(voles) +
+  tm_dots(size = 0.2)
+
+#is there a clustering pattern or are they indep?
+ggplot() +
+  geom_sf(data = humboldt) +
+  geom_sf(data = voles) +
+  
+ggsave("humvoles.png", 
+       units = "in", 
+       width = 4, 
+       height = 6, 
+       dpi = 300)
+
+```
+
+Going exploring: pt patterns in a few different ways:
+
+- quadrat analysis
+- distance based (neighbor analysis, G-fxn and K-fxn)
+
+```{r}
+
+voles_sp <- as(voles, 'Spatial')
+voles_ppp <- as(voles_sp, 'ppp') #point pattern
+
+humboldt_sp <- as(humboldt, "Spatial")
+humboldt_win <- as(humboldt_sp, "owin") #as outer window
+
+voles_pb <- ppp(voles_ppp$x, voles_ppp$y, window = humboldt_win) #creates point pattern: requires points and window
+plot(voles_pb) #now contained as one spatial unit (pts and window boundary)
+
+```
+
+Quadrat test:
+
+```{r}
+
+voles_qt <- quadrat.test(voles_pb, nx = 5, ny = 10) #gives a warning if n is too small in some of the quadrants
+
+#testing the nul hyp of spatial evennes (although you will hear it called a test for CSR)
+voles_qt
+#based on these obs, reject null of evenness -> would conclude that these events do not reflect spatial evenness
+
+plot(voles_pb)
+plot(voles_qt, add = TRUE, cex = 0.4) #above is expected # of voles per quadrant (less for partial quadrats) if evenness = TRUE and actual below
+#this could be manipulated by changing quadrat size-- be careful! Use !) literature values or 2) logical values
+
+```
+
+Plotting kernal densities for spatial data:
+
+```{r}
+
+point_density <- density(voles_pb, sigma = 0.02)
+plot(point_density)
+#risky bc bandwidth completely changes impression of data. the way they look is therefore completely arbitrary depending on bw choice. MUST ALSO REPORT BW IF USING
+
+vole_raster <- raster(point_density, crs = wgs84)
+
+tm_shape(vole_raster) +
+  tm_raster()
+
+```
+
+Nearest Neighbor:
+
+G-function considers the distance of each obs to its nearest neighbor
+K-function considers how close all neighboring obs are to an event (concentric circles)
+
+```{r}
+
+r = seq(0, 0.15, by = 0.005)
+
+gfunction <- envelope(voles_pb, fun =  Gest, r = r, nsim = 20)
+
+plot(gfunction$obs ~ gfunction$r, type = "l", col = "black") #obs as a fxn of r
+lines(gfunction$theo ~ gfunction$r, type = "l", col = "red") #plots theoretical csr
+#black line (our obs) shows higher prop of events exist w a nearest neighbor at closer distances than at csr in red = our obs are more clustered and prob not spatially random
+
+#drawback: oversimplifies relationship of events bc only considers 1 nearest neighbor so we can look at k function or in this case, the l function which is the standardized version
+
+#k/l fxn asks how close all neighbors are to EVERY event in the spatial window
+
+r2 <- seq(0, 0.5, by = 0.05) #needs greater distance of events bc includes all events instead of 1
+
+lfunction <- envelope(voles_pb, fun = Lest, r = r2, nsim = 20, global = TRUE)
+
+plot(lfunction$obs ~ lfunction$r, type = "l", col = "blue")
+lines(lfunction$theo ~ lfunction$r, type = "l", col = "red")
+#results are also indicative of clustering compared to csr
+
+```
+
+Digggle-Cressie-Loosmore-Ford test of CSR
+
+```{r}
+
+DCLFTest <- dclf.test(voles_pb, nsim = 30) 
+DCLFTest
+#give less weight that what you see and the g and l test bc if you have enough n will find diff from CSR no matter what bc of your high power
+
+```
+
+##Part 3: Spatial interpolation by kriging
+
+```{r}
+
+ks_rain <- read_csv("KSRain2.csv")
+ks_sf  <-  st_as_sf(ks_rain, coords = c("LON", "LAT"), 
+                 crs = 4326) #convert foreign obj to sf obj. give it in long then lat order
+
+plot(ks_sf)
+
+# Get county data
+ks_counties <- read_sf(dsn = 'KSCounties', layer = "ks_counties_shapefile")
+st_crs(ks_counties) = 4326
+
+plot(ks_counties)
+
+tm_shape(ks_counties) +
+  tm_fill()+
+  tm_shape(ks_sf) +
+  tm_dots("AMT", size = 0.5)
+
+```
+
+Convert to spatial file for the rainfall
+
+```{r}
+
+ks_sp <- as_Spatial(ks_sf)
+
+```
+
+Make spatial grid to interp values over
+
+```{r}
+
+lat <- seq(37, 40, length.out = 200)
+lon <- seq(-94.6, -102, length.out = 200)
+
+grid <- expand.grid(lon = lon, lat = lat)
+grid_sf <- st_as_sf(grid, coords = c("lon", "lat"), crs = 4326) #make spatial grid out of the vectors and then gives it spatial info
+grid_sp <- as_Spatial(grid_sf) #turns into spatial points data frame
+
+```
+
+make a variogram and find variogram model
+
+```{r}
+
+ks_vgm <- variogram(AMT ~ 1 , ks_sp) #~1 means using ordinary kriging
+
+plot(ks_vgm)
+
+ks_vgm_fit <- fit.variogram(ks_vgm, model = vgm(nugget = 0.2, psill = 0.8, range = 200, model = "Sph")) #give reasonalbe sarting points for iterations to come to convergence
+#Sph is spherical model but can use others (see key for example and how to check sum of squares for residuals)
+
+plot(ks_vgm, ks_vgm_fit)
+
+```
+
+Now we can do spatial interp:
+
+```{r}
+
+ks_krige <- krige(AMT ~ 1, ks_sp, grid_sp, model = ks_vgm_fit)
+
+
+```
+
+Visualize it:
+
+```{r}
+
+ks_krige_df <- as.data.frame(ks_krige)
+
+ks_krige_2 <- ks_krige_df %>%
+  rename(lon = coords.x1, lat = coords.x2, predicted = var1.pred, err = var1.var)
+
+rain_predict <- st_as_sf(ks_krige_2, coords = c("lon", "lat"), crs = 4326)
+
+# Get Kansas outline to crop: 
+ks <- read_sf(dsn = "states", layer = "cb_2017_us_state_20m") %>% 
+  dplyr::select(NAME) %>% 
+  filter(NAME == "Kansas") %>% 
+  st_transform(crs = 4326)
+
+plot(rain_predict)
+
+#crop grid to outline of KS
+rain_crop <- st_intersection(rain_predict, ks)
+plot(rain_crop)
+
+```
+
+Look at key for plotting kriging outcomes with tmap
